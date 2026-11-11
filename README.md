@@ -1,290 +1,291 @@
-# Débrider une trottinette Todimart/Vicont 039ZQ (25 → ~31 km/h) par le diamètre de roue
+# Todimart T3 — unlocking the 25 km/h speed cap by under-declaring the wheel diameter
 
-> **English abstract** — The 25 km/h cap on Todimart/Vicont `039ZQ` controllers is enforced by
-> firmware and cannot be raised: the `0x3C` "max speed" command is silently clamped to the
-> ceiling the dashboard reports (25). The workaround documented here does not touch the limit at
-> all: it under-declares the wheel diameter (EEPROM parameter **P14**, in tenths of an inch) so
-> that the controller computes a lower speed than reality. The motor then spins faster while
-> still believing it is at 25 km/h. Measured on hardware: 625 rpm → 781 rpm, i.e. **+25 % real
-> speed**, with the speedometer still reading 25.
+**Scope:** Todimart **T3** electric scooter (sold under various names, e.g. `YY-XMPRO`), fitted with a
+Todimart / Vicont `039ZQ-34` controller kit and the Vicont Android app (`com.vicontout.benben`).
 
----
+**Result:** the scooter goes from **25 km/h to ~31 km/h real speed** without touching the firmware,
+by changing one EEPROM parameter (wheel diameter). The speedometer keeps reading 25.
 
-## ⚠️ Avertissements
-
-- Cette procédure **fausse volontairement la métrologie** de l'engin. Après application :
-  - le **compteur de vitesse ment** (il affiche 25 quand vous roulez à ~31),
-  - l'**odomètre et l'autonomie restante sont sous-estimés d'environ 19 %**.
-- Un engin ainsi modifié **n'est plus conforme à son homologation** (25 km/h, catégorie
-  EDPM en France). Assurance, garantie et responsabilité en cas d'accident sont impactées.
-- La distance de freinage, la tenue de route et la charge batterie/moteur ne sont plus
-  couvertes par le constructeur (36 V, 350 W, 15 A).
-- Toutes les écritures décrites sont **réversibles** et se font en EEPROM, sans flash.
-  Aucune n'écrit dans le firmware du contrôleur.
-- Les valeurs sont données pour **un modèle précis**. Sur un autre modèle, commencez par
-  mesurer (voir §4) au lieu de recopier.
+> ⚠️ This is not a "speed limit setting". The limit stays at 25 and is never bypassed. What changes
+> is the controller's *measurement* of speed: it is told the wheel is smaller than it is, so it lets
+> the motor spin faster while still believing it is at 25 km/h.
 
 ---
 
-## 1. Matériel concerné
+## ⚠️ Warnings — read before doing anything
 
-| Élément | Valeur relevée |
+- This **deliberately falsifies the scooter's instrumentation**. After the change:
+  - the **speedometer lies** (shows 25 while you ride at ~31),
+  - the **odometer and remaining-range estimate read ~19 % low**.
+- A modified scooter is **no longer compliant with its type approval** (25 km/h, L1e-B / EPAC-class
+  rules depending on country). Insurance, warranty and liability in case of an accident are affected.
+- Braking distance, handling and battery/motor stress are no longer covered by the manufacturer
+  (36 V, 350 W, 15 A).
+- Every write described here is **reversible** and happens in EEPROM. Nothing is flashed, and no
+  firmware byte is modified.
+- The numbers below are for **one specific model**. On another unit, measure first (§4) instead of
+  copying values.
+
+---
+
+## 1. Hardware and software identified
+
+| Item | Value |
 |---|---|
-| Marque (cloud) | Todimart (`todimart.com`) |
-| Modèle | `039ZQ-34` |
-| Nom libre (cloud) | `YY-XMPRO` (clone Xiaomi Pro) |
-| Moteur | `YY-039ZQ34-D36V6G17A-S-6528` |
-| Batterie | 36 V, 350 W, 15 A max |
-| Tableau de bord (AD) | hardware **104**, firmware **58**, board **0528** |
-| Contrôleur moteur (AE) | hardware **10**, firmware **50**, board **0000** |
-| BLE | nom `vA-<MAC>`, service `FEE0`, écriture/notify `FEE2` |
-| Application d'origine | Vicont `com.vicontout.benben` |
+| Commercial model | **Todimart T3** |
+| Cloud brand | Todimart (`todimart.com`) |
+| Controller kit | `039ZQ-34` |
+| Free-form name in cloud | `YY-XMPRO` (M365 Pro clone) |
+| Motor | `YY-039ZQ34-D36V6G17A-S-6528` |
+| Battery / power | 36 V, 350 W, 15 A max |
+| Dashboard (AD) | hardware **104**, firmware **58**, board **0528** |
+| Motor controller (AE) | hardware **10**, firmware **50**, board **0000** |
+| BLE | name `vA-<MAC>`, service `FEE0`, write/notify `FEE2` |
+| Stock app | Vicont `com.vicontout.benben` v2.0.4 |
 
 ---
 
-## 2. Pourquoi le réglage de vitesse de l'app ne marche pas
+## 2. Why the app's speed setting does nothing
 
-L'application Vicont envoie la commande `0x3C` (« vitesse maximum », 1..99, `99` = *不限速*
-« sans limite »). La trame est correcte — vérifié dans le journal BLE de l'app :
-
-```
-FA AF A5 5A 3C 01 63 FA      →  code 0x3C, valeur 0x63 = 99, checksum valide
-```
-
-Le contrôleur **écrête silencieusement** et répond la valeur réellement appliquée accompagnée
-de son plafond :
+The Vicont app sends command `0x3C` ("maximum speed", 1..99, where `99` = *不限速* "no limit"). The
+frame is well formed — verified in the app's own BLE log:
 
 ```
-5A 3C 02 <valeur> <plafond> <checksum> <status>
-         ↑ appliqué  ↑ plafond firmware
+FA AF A5 5A 3C 01 63 FA      →  code 0x3C, value 0x63 = 99, checksum valid
 ```
 
-L'app teste `valeur == 0` pour valider ; recevant `25`, elle affiche « 设置失败 » et **remet
-l'ancienne valeur**. C'est exactement le clignotement observé : ce n'est pas l'app qui bride,
-c'est le firmware qui refuse.
+The controller **silently clamps** it and replies with the applied value *and* its ceiling:
 
-**L'écriture directe en EEPROM le confirme** : en écrivant P10 = 20, la trottinette roule
-réellement à 20 km/h. En écrivant P10 = 30 ou 35, elle revient à 25. Le plafond de 25 est donc
-une valeur dure du firmware, pas un défaut de configuration.
+```
+5A 3C 02 <value> <ceiling> <checksum> <status>
+         ↑ applied  ↑ firmware ceiling
+```
 
-Aucun firmware n'est par ailleurs publié pour ce modèle : `/api/upgrade/last/info` répond
-`升级类型信息不存在` pour les deux types (`AD` afficheur, `AE` contrôleur), et aucun binaire
-n'existe dans l'APK.
+The app treats `value == 0` as success; receiving `25`, it shows « 设置失败 » and **reverts to the
+old value** — exactly the blinking behaviour users report. The app is not the culprit: the firmware
+refuses.
+
+**Direct EEPROM write confirms it.** Writing P10 = 20 makes the scooter genuinely top out at 20 km/h.
+Writing P10 = 30 or 35 brings it back to 25. The 25 km/h ceiling is a hard-coded firmware value, not
+a configuration mistake.
+
+No firmware is published for this model either: `GET /api/upgrade/last/info` returns
+`升级类型信息不存在` for both types (`AD` dashboard, `AE` controller), and no image is embedded in the
+APK.
 
 ---
 
-## 3. Le contournement : sous-déclarer le diamètre de roue
+## 3. The bypass: under-declaring the wheel diameter
 
-Le contrôleur calcule la vitesse affichée **et** le point de limitation à partir du régime
-moteur et d'un **diamètre de roue déclaré en EEPROM** :
-
-```
-vitesse_kmh = régime_tr_min × π × D_mètres × 60 / 1000
-```
-
-Si on déclare une roue **plus petite** que la vraie, alors pour un même régime le contrôleur
-calcule une vitesse plus faible. Il autorise donc un régime plus élevé avant d'atteindre sa
-limite de 25 — mais la roue, elle, tourne vraiment plus vite.
-
-Le paramètre est **P14** (« Wheel diameter »), en **dixièmes de pouce** :
+The controller derives both the displayed speed **and** the limiting point from the motor rpm and a
+**wheel diameter stored in EEPROM**:
 
 ```
-D_mètres = P14 × 0.00254        (P14 = 83  →  8,3 pouces  →  210,8 mm)
+speed_kmh = rpm × π × D_metres × 60 / 1000
 ```
 
-Formule d'ajustement :
+Declare a **smaller** wheel than reality, and for the same rpm the controller computes a lower speed.
+It therefore allows a higher rpm before reaching its 25 km/h limit — while the wheel really spins
+faster.
+
+The parameter is **P14** ("Wheel diameter"), expressed in **tenths of an inch**:
 
 ```
-P14_nouveau = P14_origine × (vitesse_affichée / vitesse_réelle_voulue)
+D_metres = P14 × 0.00254        (P14 = 83  →  8.3 inches  →  210.8 mm)
 ```
 
-Pour passer de 25 à 31 km/h : `83 × 25/31 ≈ 67`.
+Adjustment formula:
+
+```
+P14_new = P14_stock × (indicated_speed / desired_real_speed)
+```
+
+To go from 25 to 31 km/h: `83 × 25/31 ≈ 67`.
 
 ---
 
-## 4. Mesurer le diamètre déclaré sans le lire
+## 4. Measuring the declared diameter without reading it
 
-Les paramètres d'EEPROM **ne sont pas lisibles** par le protocole sur ce firmware : la commande
-`0xC9` (« afficher le paramètre sur l'écran du tableau de bord ») n'est pas implémentée, et il
-n'existe aucune trame de lecture. La seule méthode fiable est de **déduire** la valeur d'une
-mesure physique : régime moteur et vitesse affichée sont émis en permanence dans la trame de
-télémétrie `0x10`.
+EEPROM parameters **cannot be read back** on this firmware: the `0xC9` "show parameter on the
+dashboard" command is not implemented, and there is no read frame at all. The reliable method is to
+**derive** the value from a physical measurement: motor rpm and indicated speed are both broadcast in
+the `0x10` telemetry frame.
 
-Protocole de mesure :
+Measurement procedure:
 
-1. Roue arrière **levée** (l'écrêtage s'applique aussi à vide, ce qui rend la mesure reproductible).
-2. Plein gaz, **régime stabilisé** 15-20 s.
-3. Relever simultanément le **régime** (tr/min) et la **vitesse affichée**.
+1. Rear wheel **off the ground** (the clamp applies unloaded too, which makes the measurement
+   reproducible).
+2. Full throttle, **stabilised rpm** for 15–20 s.
+3. Read **rpm** and **indicated speed** at the same time.
 
-Le régime est la grandeur honnête : il ne peut pas être écrêté comme le compteur. Calcul :
+Rpm is the honest quantity: unlike the speedometer, it cannot be clamped. Then:
 
 ```
-D_mètres = vitesse_affichée × 1000 / (60 × π × régime)
-P14      = D_mètres / 0.00254
+D_metres = indicated_kmh × 1000 / (60 × π × rpm)
+P14      = D_metres / 0.00254
 ```
 
-Exemple réel (valeurs d'usine) : 24,9 km/h à 625 tr/min → D = 211,4 mm → **P14 = 83**.
+Real example (stock values): 24.9 km/h at 625 rpm → D = 211.4 mm → **P14 = 83**.
 
 ---
 
-## 5. Procédure complète
+## 5. Full procedure
 
-### Matériel / logiciel
+### Software required
 
-L'application d'origine **ne sait pas** écrire les paramètres P. Il faut un client qui expose la
-commande `0xD2` (écriture de paramètre EEPROM). Utilisé ici :
+The stock app **cannot** write P parameters. You need a client that exposes command `0xD2` (EEPROM
+parameter write). Used here:
 
-- **[AovoControl](https://github.com/YouRooni/AovoControl)** (open source, Android, support ViCont)
-- activer **Settings → Expert mode**, puis **Settings → Engineering menu**
+- **[AovoControl](https://github.com/YouRooni/AovoControl)** (open source, Android, ViCont support)
+- enable **Settings → Expert mode**, then open **Settings → Engineering menu**
+- add the **Motor speed** tile to the dashboard (Edit dashboard → Add tile → Motor speed); it is the
+  measurement instrument
 
-### Étapes
+### Steps
 
-1. **Relever les valeurs d'origine** (à noter avant toute écriture) :
-   - menu d'ingénierie → **P14** (affiche `10` par défaut : le logiciel ne lit rien, c'est une
-     valeur de remplissage, ne pas la confondre avec la valeur réelle) ;
-   - **P10** (limite Sport) — lisible, c'est la valeur renvoyée par `0x3C` ;
-   - **P15** (source tachymètre) ;
-   - couple de démarrage : écran *Controller parameters* → *Throttle response* (1..10).
-2. **Mesurer le diamètre réel** comme au §4 (roue levée, plein gaz, régime + vitesse).
-3. **Calculer** `P14_nouveau = P14_origine × 25 / vitesse_voulue`.
-4. **Écrire** : menu d'ingénierie → P14 → curseur → *Apply*.
-   Trame émise : `FA AF A5 5A D2 02 0D <valeur> <somme>`
-5. **Vérifier** : refaire la mesure du §4. Le régime doit **augmenter** dans le rapport prévu ;
-   la vitesse affichée doit rester **25**. C'est la signature du succès.
-6. Contrôle final **en roulant**, sur route fermée, avec un GPS : la vitesse réelle doit
-   correspondre au calcul.
+1. **Record the stock values** before writing anything:
+   - Engineering menu → **P14** (it displays `10` by default: the app reads nothing, that is a filler
+     value, not the real one),
+   - **P10** (Sport limit) — readable, this one comes from the `0x3C` reply,
+   - **P15** (speedometer source),
+   - starting torque: *Controller parameters* → *Throttle response* (1..10 scale).
+2. **Measure the real diameter** as in §4 (wheel up, full throttle, rpm + speed).
+3. **Compute** `P14_new = P14_stock × 25 / desired_speed`.
+4. **Write**: Engineering menu → P14 → slider → *Apply*.
+   Frame sent: `FA AF A5 5A D2 02 0D <value> <sum>`
+5. **Verify**: repeat the §4 measurement. Rpm must **increase** by the predicted ratio while the
+   indicated speed stays at **25**. That is the signature of success.
+6. Final check **while riding**, on a closed road, against GPS: real speed must match the calculation.
 
-### Valeurs mesurées sur cet engin (référence)
+### Values measured on this unit (reference)
 
-| P14 | Régime max (roue levée) | Vitesse réelle |
+| P14 | Max rpm (wheel up) | Real speed |
 |---|---|---|
-| **83** (usine) | 625 tr/min | **24,9 km/h** |
-| 80 | 660 tr/min | 26,3 km/h |
-| **67** (retenu) | 768–781 tr/min | **≈31 km/h** |
+| **83** (stock) | 625 rpm | **24.9 km/h** |
+| 80 | 660 rpm | 26.3 km/h |
+| **67** (retained) | 768–781 rpm | **≈31 km/h** |
 
 ---
 
-## 6. Couple (optionnel, indépendant de la vitesse)
+## 6. Torque (optional, independent of speed)
 
-Les deux réglages de couple ne sont pas soumis à l'écrêtage de vitesse. Commandes directes
-`0x3D` (couple de démarrage) et `0x3E` (couple max en roulage), valeurs brutes **0..200**
-(200 = 100 %) :
+The two torque settings are not subject to the speed clamp. Direct commands `0x3D` (starting torque)
+and `0x3E` (max driving torque), raw values **0..200** (200 = 100 %):
 
 ```
-FA AF A5 5A 3D 01 C8 60     → couple de démarrage = 200/200
-FA AF A5 5A 3E 01 C8 61     → couple de roulage    = 200/200
+FA AF A5 5A 3D 01 C8 60     → starting torque = 200/200
+FA AF A5 5A 3E 01 C8 61     → driving torque  = 200/200
 ```
 
-Vérification de `0x3D` : écran *Controller parameters* → *Throttle response* passe de `8` à `10`
-(échelle 1..10 reconstruite depuis 0..200). `0x3E` n'a pas d'affichage dédié sur cet écran.
+Verifying `0x3D`: *Controller parameters* → *Throttle response* goes from `8` to `10` (1..10 scale
+rebuilt from 0..200). `0x3E` has no dedicated readout on that screen.
 
-Effet : accélération plus franche, courant d'appel plus élevé, usure et échauffement accrus.
+Effect: sharper acceleration, higher inrush current, more heat and wear.
 
 ---
 
-## 7. Retour à l'état d'usine
+## 7. Returning to stock
 
-| Paramètre | Valeur d'origine |
+| Parameter | Stock value |
 |---|---|
-| **P14** (diamètre) | **83** |
-| **0x3D** (couple démarrage) | **160** (0xA0, soit 8/10) |
-| **P15** (source tachymètre) | **0** (défaut documenté) |
-| P10 (limite) | 25 (inchangée par la procédure) |
+| **P14** (diameter) | **83** |
+| **0x3D** (starting torque) | **160** (`0xA0`, i.e. 8/10) |
+| **P15** (speedometer source) | **0** (documented default) |
+| P10 (limit) | 25 (untouched by this procedure) |
 
-Trames correspondantes :
+Corresponding frames:
 
 ```
-FA AF A5 5A D2 02 0D 53 <somme>     → P14 = 83
-FA AF A5 5A 3D 01 A0 <somme>        → couple démarrage = 160
-FA AF A5 5A D2 02 0E 00 <somme>     → P15 = 0
+FA AF A5 5A D2 02 0D 53 <sum>     → P14 = 83
+FA AF A5 5A 3D 01 A0 <sum>        → starting torque = 160
+FA AF A5 5A D2 02 0E 00 <sum>     → P15 = 0
 ```
 
-Après remise à 83, le compteur, l'odomètre et la limite retrouvent leur cohérence d'origine.
+After restoring 83, the speedometer, odometer and limit are consistent again.
 
 ---
 
-## 8. Référence du protocole (relevée sur l'engin)
+## 8. Protocol reference (as observed on the device)
 
-### Trame
-
-```
-FA AF A5 | zt(0x5A) | code | len | data… | checksum
-```
-
-`checksum = (zt + code + len + Σdata) & 0xFF`
-
-Les réponses **n'ont pas** le préambule :
+### Framing
 
 ```
-zt | code | len | payload… | checksum | status
+FA AF A5 | zt(0x5A) | command | length | payload… | checksum
 ```
 
-### Commandes utiles
+`checksum = (zt + command + length + Σpayload) & 0xFF`
 
-| Code | Sens | Payload |
+Replies carry **no** preamble:
+
+```
+zt | command | length | payload… | checksum | status
+```
+
+### Useful commands
+
+| Code | Direction | Payload |
 |---|---|---|
-| `0x01` | démarrer la télémétrie | — |
-| `0x10` | **RX** télémétrie | vitesse `u16/10` km/h, rpm `u16`, tension `u16/100`, courant |
-| `0x11` | **RX** état | rapport, éclairage, défauts |
-| `0x12` | **RX** versions | hw/sw afficheur et contrôleur |
-| `0x3C` | vitesse max | 1..99 (**écrêté à 25**) · réponse `[valeur, plafond]` |
-| `0x3D` | couple de démarrage | 0..200 |
-| `0x3E` | couple / courant max | 0..200 |
-| `0x3F` | frein électromagnétique | 0..200 |
-| `0x42` | rapport | 1..5 |
-| `0xAB` | versions | `AD` = afficheur, `AE` = contrôleur |
-| `0xC9` | afficher un paramètre à l'écran | index (**non implémenté ici**) |
-| `0xD2` | **écrire un paramètre EEPROM** | `index, valeur` |
+| `0x01` | TX | start telemetry |
+| `0x10` | **RX** telemetry | speed `u16/10` km/h, rpm `u16`, voltage `u16/100`, current |
+| `0x11` | **RX** state | gear, lights, fault bits |
+| `0x12` | **RX** versions | dashboard/controller hw+sw, gear mask |
+| `0x3C` | TX | max speed 1..99 (**clamped to 25**) · reply `[value, ceiling]` |
+| `0x3D` | TX | starting torque 0..200 |
+| `0x3E` | TX | max driving torque / current 0..200 |
+| `0x3F` | TX | electromagnetic brake 0..200 |
+| `0x42` | TX | gear 1..5 |
+| `0xAB` | TX | versions: `AD` dashboard, `AE` controller |
+| `0xC9` | TX | show a parameter on the dashboard (**not implemented here**) |
+| `0xD2` | TX | **write an EEPROM parameter**: `index, value` |
 
-`index = numéro_P - 1` (P10 → 9, P14 → 13, P15 → 14).
+`index = P_number - 1` (P10 → 9, P14 → 13, P15 → 14).
 
-### Paramètres P utiles
+### Relevant P parameters
 
-| P | Index | Rôle | Plage | Unité |
+| P | Index | Meaning | Range | Unit |
 |---|---|---|---|---|
-| P8 | 7 | limite Eco | 1..99 | km/h |
-| P9 | 8 | limite Drive | 1..99 | km/h |
-| **P10** | **9** | **limite Sport** (= `0x3C`) | 1..99 | km/h |
-| P11 | 10 | limite rapport 4 | 1..99 | km/h |
-| P12 | 11 | limite rapport 5 | 1..99 | km/h |
-| P13 | 12 | paires de pôles | 1..99 | — |
-| **P14** | **13** | **diamètre de roue** | 1..99 | 1/10 pouce |
-| P15 | 14 | source du tachymètre | 0..9 | — |
+| P8 | 7 | Eco limit | 1..99 | km/h |
+| P9 | 8 | Drive limit | 1..99 | km/h |
+| **P10** | **9** | **Sport limit** (= `0x3C`) | 1..99 | km/h |
+| P11 | 10 | Gear 4 limit | 1..99 | km/h |
+| P12 | 11 | Gear 5 limit | 1..99 | km/h |
+| P13 | 12 | Motor pole pairs | 1..99 | — |
+| **P14** | **13** | **Wheel diameter** | 1..99 | 1/10 inch |
+| P15 | 14 | Speedometer source | 0..9 | — |
 
 ---
 
-## 9. Pistes écartées (pour ne pas les refaire)
+## 9. Dead ends (so nobody repeats them)
 
-| Piste | Résultat |
+| Attempt | Outcome |
 |---|---|
-| P10 > 25 par `0x3C` | écrêté à 25 par le firmware |
-| P10 > 25 par `0xD2` (écriture directe) | écrêté à 25 également |
-| Firmware OTA Vicont (`AD`/`AE`) | `升级类型信息不存在` — rien de publié |
-| Firmware dans l'APK | aucun `.bin`, `demo1.8` n'est qu'un nom de fichier par défaut |
-| Firmware public (GitHub, scooterhacking) | inexistant pour `039ZQ` / board `0528` |
-| Firmware Xiaomi (M365, Pro, 1S…) | matériel et protocole différents — incompatible, brick |
-| SHU / DownG | parlent `55 AA` / `5A A5`, services `FFE0`/`FFE1` → « appareil inconnu » |
-| P15 = 6 (« vitesse réelle ») | sans effet : la même constante de diamètre est utilisée partout |
-| P13 (paires de pôles) | même famille d'effet que P14, non testé sur cet engin |
+| `0x3C` above 25 | clamped to 25 by the firmware |
+| `0xD2` P10 above 25 (direct EEPROM write) | clamped to 25 as well |
+| Vicont OTA firmware (`AD`/`AE`) | `升级类型信息不存在` — nothing published |
+| Firmware inside the APK | no `.bin`; `demo1.8` is only a default filename string |
+| Public firmware (GitHub, scooterhacking.org) | nothing for `039ZQ` / board `0528` |
+| Xiaomi firmware (M365, Pro, 1S, Max…) | different MCU, different protocol (`55 AA`), incompatible — bricks the controller |
+| Scooter Hacking Utility / DownG | speak `55 AA` / `5A A5` on services `FFE0`/`FFE1` → "unknown device" |
+| P15 = 6 ("real speed" source) | no effect: the same diameter constant is used everywhere |
+| P13 (pole pairs) | same family of effect as P14, not tested on this unit |
 
 ---
 
-## 10. Pourquoi l'affichage ne peut pas être corrigé
+## 10. Why the speedometer cannot be fixed
 
-Tous les calculs — vitesse affichée, odomètre, point de limitation — dérivent du **même**
-diamètre déclaré. Il n'existe pas de constante « vraie » séparée. Dès que P14 ment, tout ment
-de façon cohérente. Le compromis est donc **structurel**, pas un réglage oublié :
+Every calculation — indicated speed, odometer, limiting point — derives from the **same** declared
+diameter. There is no separate "true" constant. As soon as P14 lies, everything lies consistently.
+The trade-off is therefore **structural**, not a missed setting:
 
-- vitesse réelle maximale ; ou
-- affichage et odomètre justes.
+- maximum real speed; **or**
+- accurate speedometer and odometer.
 
 ---
 
-## Crédits
+## Credits
 
-- **[YouRooni/AovoControl](https://github.com/YouRooni/AovoControl)** — client open source qui
-  documente le menu d'ingénierie ViCont et la commande `0xD2`, sans lequel ce contournement
-  aurait été difficile à identifier. Les descriptions des P-paramètres citées ici viennent de
-  son code (`EngineeringParams.kt`).
-- La cartographie `0x3C`/`0x3D`/`0x3E`/`0x3F` et le format des trames ont été confirmés par
-  rétro-ingénierie du bundle uni-app de l'app Vicont `com.vicontout.benben` v2.0.4.
+- **[YouRooni/AovoControl](https://github.com/YouRooni/AovoControl)** — the open-source client that
+  documents the ViCont engineering menu and command `0xD2`, without which this bypass would have been
+  far harder to find. The P-parameter descriptions quoted here come from its `EngineeringParams.kt`.
+- The `0x3C`/`0x3D`/`0x3E`/`0x3F` command map and the frame layout were confirmed by reverse
+  engineering the uni-app bundle of the Vicont app `com.vicontout.benben` v2.0.4.
